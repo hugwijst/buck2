@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::mem;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -192,15 +193,46 @@ impl NotifyFileWatcher {
         let data = Arc::new(Mutex::new(Ok(NotifyFileData::new())));
         let data2 = data.dupe();
         let root2 = root.dupe();
-        let mut watcher = notify::recommended_watcher(move |event| {
-            let mut guard = data2.lock().unwrap();
-            if let Ok(state) = &mut *guard {
-                if let Err(e) = state.process(event, &root2, &cells, &ignore_specs) {
-                    *guard = Err(e);
+        let ignore_specs = Arc::new(ignore_specs);
+        let config = notify::Config::default().with_follow_symlinks(false);
+        let event_handler = {
+            let cells = cells.dupe();
+            let ignore_specs = ignore_specs.dupe();
+            move |event| {
+                let mut guard = data2.lock().unwrap();
+                if let Ok(state) = &mut *guard {
+                    if let Err(e) = state.process(event, &root2, &cells, &ignore_specs) {
+                        *guard = Err(e);
+                    }
                 }
             }
-        })?;
-        watcher.watch(root.root().as_path(), notify::RecursiveMode::Recursive)?;
+        };
+        let mut watcher = notify::RecommendedWatcher::new(event_handler, config)?;
+        watcher.watch_filtered(
+            root.root().as_path(),
+            notify::RecursiveMode::Recursive,
+            Box::new({
+                let root = root.dupe();
+                move |path| {
+                    fn cell_path(
+                        root: &ProjectRoot,
+                        cells: &CellResolver,
+                        path: &Path,
+                    ) -> anyhow::Result<CellPath> {
+                        let path = root.relativize(AbsNormPath::new(&path)?)?;
+                        cells.get_cell_path(&path)
+                    }
+                    let Ok(cell_path) = cell_path(&root, &cells, &path) else {
+                        return true;
+                    };
+                    let ignore = ignore_specs
+                        .get(&cell_path.cell())
+                        .expect("unexpected cell name mismatch")
+                        .is_match(cell_path.path());
+                    !ignore
+                }
+            }),
+        )?;
         Ok(Self { watcher, data })
     }
 
